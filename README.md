@@ -191,7 +191,7 @@ Or via the Rails console (`bin/rails console`) for interactive exploration.
 
 The TED adapter requires a `TED_API_KEY` environment variable (free registration at developer.ted.europa.eu). All other sources require no API key.
 
-**Full Portal BASE ingestion (all active Portal BASE data sources):**
+**Full Portal BASE ingestion (snapshot):**
 
 ```bash
 # Development/test: runs inline page-by-page
@@ -210,24 +210,37 @@ Operational parameters:
 - `PORTAL_BASE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default `3` consecutive failures per DataSource)
 
 Snapshot semantics:
-- Full ingestion is always a fresh snapshot (`page=1`).
-- `last_success_page` is **recovery-only** and only reused when the same `run_id` is active.
+- Full ingestion always starts at `page=1`.
+- `last_success_page` is recovery-only and is reused only when the active `run_id` matches.
 - Every full enqueue assigns a new `run_id` per DataSource under `data_sources.config["portal_base_ingestion"]`.
 
-Circuit breaker semantics:
-- Breaker is scoped per DataSource and opens after N consecutive transient failures.
-- Open-state TTL is 15 minutes.
-- First successful page import clears breaker state automatically.
+Resilience semantics:
+- Circuit breaker is scoped per DataSource, opens after consecutive transient failures, and has a 15-minute TTL.
+- Transient HTTP statuses (`429`, `5xx`) are retried via job retry policy.
 
 Progress & verification:
 
 ```bash
-# per-data-source checkpoints / counts
-bin/rails runner "puts DataSource.portal_base.select(:id, :name, :status, :record_count, :last_success_page).map(&:attributes)"
+# inspect current run context (run_id/start timestamps) per DataSource
+bin/rails runner "puts DataSource.portal_base.select(:id, :name, :status, :last_success_page, :config).map { |ds| { id: ds.id, name: ds.name, status: ds.status, last_success_page: ds.last_success_page, portal_base_ingestion: ds.config_hash['portal_base_ingestion'] } }"
 
-# total imported contracts from Portal BASE sources
+# contracts imported from Portal BASE sources
 bin/rails runner "puts Contract.joins(:data_source).where(data_sources: { adapter_class: 'PublicContracts::PT::PortalBaseClient' }).count"
+
+# record_count reconciliation per DataSource
+bin/rails runner "puts DataSource.portal_base.select(:id, :name, :record_count, :last_success_page).map(&:attributes)"
 ```
+
+Expected output (example):
+- `portal_base_ingestion.run_id` populated with a UUID.
+- `last_success_page` increasing while pages are processed.
+- `record_count` converging to the imported `contracts` volume for each DataSource.
+
+Troubleshooting:
+- **Breaker opened:** wait for TTL (~15 minutes) and rerun `bin/rails portal_base:ingest:full`.
+- **Resume same run:** re-enqueue `PortalBase::IngestDataSourceJob` with the same `run_id` to continue from `last_success_page + 1`.
+- **Force new snapshot:** run `bin/rails portal_base:ingest:full` again (new `run_id`, starts from page 1).
+
 
 #### Adding a new data source
 

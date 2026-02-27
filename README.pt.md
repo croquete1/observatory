@@ -183,7 +183,7 @@ bin/rails runner "DataSource.active_sources.each { |ds| ImportService.new(ds).ca
 
 O adaptador TED requer a variável de ambiente `TED_API_KEY` (registo gratuito em developer.ted.europa.eu). Todas as outras fontes não requerem chave de API.
 
-**Ingestão completa do Portal BASE (todas as DataSources Portal BASE ativas):**
+**Full Portal BASE ingestion (snapshot):**
 
 ```bash
 # Desenvolvimento/teste: corre inline, página a página
@@ -202,24 +202,37 @@ Parâmetros operacionais:
 - `PORTAL_BASE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default `3` falhas consecutivas por DataSource)
 
 Semântica de snapshot:
-- A ingestão completa é sempre um snapshot novo (`page=1`).
-- `last_success_page` é **apenas para recovery** e só é reutilizado quando o `run_id` ativo coincide.
-- Cada execução full enfileirada gera um `run_id` novo por DataSource em `data_sources.config["portal_base_ingestion"]`.
+- A ingestão completa começa sempre em `page=1`.
+- `last_success_page` é apenas para recovery e só é reutilizado quando o `run_id` ativo coincide.
+- Cada execução full gera um novo `run_id` por DataSource em `data_sources.config["portal_base_ingestion"]`.
 
-Semântica do circuit breaker:
-- O breaker é por DataSource e abre após N falhas transitórias consecutivas.
-- O estado aberto tem TTL de 15 minutos.
-- A primeira página importada com sucesso limpa automaticamente o estado do breaker.
+Semântica de resiliência:
+- O circuit breaker é por DataSource, abre após falhas transitórias consecutivas e tem TTL de 15 minutos.
+- Status transitórios HTTP (`429`, `5xx`) usam retries pela política de jobs.
 
 Progresso e verificação:
 
 ```bash
-# checkpoints / contagens por DataSource
-bin/rails runner "puts DataSource.portal_base.select(:id, :name, :status, :record_count, :last_success_page).map(&:attributes)"
+# ver contexto do run (run_id/timestamps) por DataSource
+bin/rails runner "puts DataSource.portal_base.select(:id, :name, :status, :last_success_page, :config).map { |ds| { id: ds.id, name: ds.name, status: ds.status, last_success_page: ds.last_success_page, portal_base_ingestion: ds.config_hash['portal_base_ingestion'] } }"
 
-# total de contratos importados de fontes Portal BASE
+# contratos importados das fontes Portal BASE
 bin/rails runner "puts Contract.joins(:data_source).where(data_sources: { adapter_class: 'PublicContracts::PT::PortalBaseClient' }).count"
+
+# reconciliação de record_count por DataSource
+bin/rails runner "puts DataSource.portal_base.select(:id, :name, :record_count, :last_success_page).map(&:attributes)"
 ```
+
+Output esperado (exemplo):
+- `portal_base_ingestion.run_id` preenchido com UUID.
+- `last_success_page` a aumentar enquanto as páginas são processadas.
+- `record_count` a convergir para o volume de `contracts` importados por DataSource.
+
+Troubleshooting:
+- **Breaker aberto:** aguardar TTL (~15 minutos) e voltar a correr `bin/rails portal_base:ingest:full`.
+- **Retomar o mesmo run:** reenfileirar `PortalBase::IngestDataSourceJob` com o mesmo `run_id` para continuar em `last_success_page + 1`.
+- **Forçar snapshot novo:** executar novamente `bin/rails portal_base:ingest:full` (novo `run_id`, reinicia em page 1).
+
 
 #### Adicionar uma nova fonte de dados
 
