@@ -178,10 +178,37 @@ bin/rails runner "DataSource.find_by(adapter_class: 'PublicContracts::EU::TedCli
 **Importar todas as fontes ativas:**
 
 ```bash
-bin/rails runner "DataSource.where(active: true).each { |ds| ImportService.new(ds).call }"
+bin/rails runner "DataSource.active_sources.each { |ds| ImportService.new(ds).call }"
 ```
 
 O adaptador TED requer a variável de ambiente `TED_API_KEY` (registo gratuito em developer.ted.europa.eu). Todas as outras fontes não requerem chave de API.
+
+**Ingestão completa do Portal BASE (todas as DataSources Portal BASE ativas):**
+
+```bash
+# Desenvolvimento/teste: corre inline, página a página
+bin/rails portal_base:ingest:full PORTAL_BASE_PAGE_SIZE=100
+
+# Produção: enfileira jobs no Solid Queue
+bin/rails portal_base:ingest:full PORTAL_BASE_PAGE_SIZE=100
+```
+
+Parâmetros operacionais:
+- `PORTAL_BASE_PAGE_SIZE` (default `100`)
+- `PORTAL_BASE_QUEUE_THREADS` (default `1`)
+- `PORTAL_BASE_QUEUE_PROCESSES` (default `1`)
+- `PORTAL_BASE_MAX_RETRIES` (default `5`)
+- `PORTAL_BASE_PAGE_SLEEP_SECONDS` (default `0.1`)
+
+Progresso e verificação:
+
+```bash
+# checkpoints / contagens por DataSource
+bin/rails runner "puts DataSource.portal_base.select(:id, :name, :status, :record_count, :last_success_page).map(&:attributes)"
+
+# total de contratos importados de fontes Portal BASE
+bin/rails runner "puts Contract.joins(:data_source).where(data_sources: { adapter_class: 'PublicContracts::PT::PortalBaseClient' }).count"
+```
 
 #### Adicionar uma nova fonte de dados
 
