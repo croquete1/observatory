@@ -178,10 +178,61 @@ bin/rails runner "DataSource.find_by(adapter_class: 'PublicContracts::EU::TedCli
 **Importar todas as fontes ativas:**
 
 ```bash
-bin/rails runner "DataSource.where(active: true).each { |ds| ImportService.new(ds).call }"
+bin/rails runner "DataSource.active_sources.each { |ds| ImportService.new(ds).call }"
 ```
 
 O adaptador TED requer a variável de ambiente `TED_API_KEY` (registo gratuito em developer.ted.europa.eu). Todas as outras fontes não requerem chave de API.
+
+**Full Portal BASE ingestion (snapshot):**
+
+```bash
+# Desenvolvimento/teste: corre inline, página a página
+bin/rails portal_base:ingest:full PORTAL_BASE_PAGE_SIZE=100
+
+# Produção: enfileira jobs no Solid Queue
+bin/rails portal_base:ingest:full PORTAL_BASE_PAGE_SIZE=100
+```
+
+Parâmetros operacionais:
+- `PORTAL_BASE_PAGE_SIZE` (default `100`)
+- `PORTAL_BASE_QUEUE_THREADS` (default `1`, limitado a `2`)
+- `PORTAL_BASE_QUEUE_PROCESSES` (default `1`, limitado a `2`)
+- `PORTAL_BASE_MAX_RETRIES` (default `5`)
+- `PORTAL_BASE_PAGE_SLEEP_SECONDS` (default `0.1`)
+- `PORTAL_BASE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default `3` falhas consecutivas por DataSource)
+
+Semântica de snapshot:
+- A ingestão completa começa sempre em `page=1`.
+- `last_success_page` é apenas para recovery e só é reutilizado quando o `run_id` ativo coincide.
+- Cada execução full gera um novo `run_id` por DataSource em `data_sources.config["portal_base_ingestion"]`.
+
+Semântica de resiliência:
+- O circuit breaker é por DataSource, abre após falhas transitórias consecutivas e tem TTL de 15 minutos.
+- Status transitórios HTTP (`429`, `5xx`) usam retries pela política de jobs.
+
+Progresso e verificação:
+
+```bash
+# ver contexto do run (run_id/timestamps) por DataSource
+bin/rails runner "puts DataSource.portal_base.select(:id, :name, :status, :last_success_page, :config).map { |ds| { id: ds.id, name: ds.name, status: ds.status, last_success_page: ds.last_success_page, portal_base_ingestion: ds.config_hash['portal_base_ingestion'] } }"
+
+# contratos importados das fontes Portal BASE
+bin/rails runner "puts Contract.joins(:data_source).where(data_sources: { adapter_class: 'PublicContracts::PT::PortalBaseClient' }).count"
+
+# reconciliação de record_count por DataSource
+bin/rails runner "puts DataSource.portal_base.select(:id, :name, :record_count, :last_success_page).map(&:attributes)"
+```
+
+Output esperado (exemplo):
+- `portal_base_ingestion.run_id` preenchido com UUID.
+- `last_success_page` a aumentar enquanto as páginas são processadas.
+- `record_count` a convergir para o volume de `contracts` importados por DataSource.
+
+Troubleshooting:
+- **Breaker aberto:** aguardar TTL (~15 minutos) e voltar a correr `bin/rails portal_base:ingest:full`.
+- **Retomar o mesmo run:** reenfileirar `PortalBase::IngestDataSourceJob` com o mesmo `run_id` para continuar em `last_success_page + 1`.
+- **Forçar snapshot novo:** executar novamente `bin/rails portal_base:ingest:full` (novo `run_id`, reinicia em page 1).
+
 
 #### Adicionar uma nova fonte de dados
 
