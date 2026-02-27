@@ -1,16 +1,25 @@
 require "test_helper"
 
 class PublicContracts::ImportServiceTest < ActiveSupport::TestCase
+  FakeAdapter = Struct.new(:pages) do
+    def fetch_contracts(page:, limit:)
+      _ = limit
+      pages.fetch(page, [])
+    end
+  end
+
   def build_contract_attrs(overrides = {})
     {
-      "external_id"   => "ext-#{SecureRandom.hex(4)}",
-      "object"        => "Serviços de consultoria",
-      "country_code"  => "PT",
+      "external_id" => "ext-#{SecureRandom.hex(4)}",
+      "object" => "Serviços de consultoria",
+      "country_code" => "PT",
       "contract_type" => "Aquisição de Serviços",
-      "base_price"    => 15000.0,
+      "procedure_type" => "Ajuste direto",
+      "publication_date" => Date.current,
+      "base_price" => 15000.0,
       "contracting_entity" => {
         "tax_identifier" => "500000001",
-        "name"           => "Câmara Municipal Teste",
+        "name" => "Câmara Municipal Teste",
         "is_public_body" => true
       },
       "winners" => [
@@ -19,150 +28,150 @@ class PublicContracts::ImportServiceTest < ActiveSupport::TestCase
     }.merge(overrides)
   end
 
-  def with_mocked_adapter(contracts)
-    adapter = Minitest::Mock.new
-    adapter.expect(:fetch_contracts, contracts)
+  test "full mode always starts from page 1" do
+    attrs = build_contract_attrs
     ds = data_sources(:portal_base)
-    ds.stub(:adapter, adapter) do
-      yield ds, adapter
+    ds.update!(last_success_page: 5)
+
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ attrs ], 2 => [] })) do
+      result = PublicContracts::ImportService.new(ds).call(full: true, page_size: 10)
+      assert_equal 1, result[:start_page]
+      assert_equal 1, result[:inserted]
     end
-    adapter.verify
   end
 
-  # ── happy path ────────────────────────────────────────────────────────────
-
-  test "call creates a contract from adapter data" do
+  test "imports one page with bulk upsert and updates counters" do
     attrs = build_contract_attrs
-    with_mocked_adapter([ attrs ]) do |ds, _|
+    ds = data_sources(:portal_base)
+
+    ds.stub(:adapter, FakeAdapter.new({ 2 => [ attrs ] })) do
+      result = PublicContracts::ImportService.new(ds).call(page: 2, page_size: 10)
+      assert_equal 1, result[:fetched]
+      assert_equal 1, result[:inserted]
+      assert_equal 0, result[:updated]
+      assert_equal 0, result[:failed]
+    end
+
+    ds.reload
+    assert_equal 2, ds.last_success_page
+    assert ds.active?
+    assert_equal Contract.where(data_source_id: ds.id).count, ds.record_count
+  end
+
+  test "importing same page twice is idempotent" do
+    attrs = build_contract_attrs("external_id" => "same-contract")
+    ds = data_sources(:portal_base)
+
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ attrs ] })) do
+      PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
+      assert_no_difference "Contract.count" do
+        result = PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
+        assert_equal 0, result[:inserted]
+        assert_equal 1, result[:updated]
+      end
+    end
+  end
+
+  test "internal fields are not overwritten by upsert" do
+    attrs = build_contract_attrs("external_id" => "protected-contract")
+    ds = data_sources(:portal_base)
+
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ attrs ] })) do
+      PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
+    end
+
+    contract = Contract.find_by!(external_id: "protected-contract", country_code: "PT")
+    original_created_at = contract.created_at
+
+    sleep 0.01
+    updated = attrs.merge("object" => "Novo objeto")
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ updated ] })) do
+      PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
+    end
+
+    contract.reload
+    assert_equal original_created_at.to_i, contract.created_at.to_i
+    assert_equal "Novo objeto", contract.object
+  end
+
+  test "creates contracting entity winner and join row" do
+    attrs = build_contract_attrs
+    ds = data_sources(:portal_base)
+
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ attrs ] })) do
       assert_difference "Contract.count", 1 do
-        PublicContracts::ImportService.new(ds).call
+        assert_difference "Entity.count", 2 do
+          assert_difference "ContractWinner.count", 1 do
+            PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
+          end
+        end
       end
     end
   end
 
-  test "call creates the contracting entity" do
-    attrs = build_contract_attrs
-    with_mocked_adapter([ attrs ]) do |ds, _|
-      assert_difference "Entity.count", 2 do
-        PublicContracts::ImportService.new(ds).call
-      end
-    end
-  end
-
-  test "call creates winner entity and contract_winner" do
-    attrs = build_contract_attrs
-    with_mocked_adapter([ attrs ]) do |ds, _|
-      assert_difference "ContractWinner.count", 1 do
-        PublicContracts::ImportService.new(ds).call
-      end
-    end
-  end
-
-  test "call sets data_source on contract" do
-    attrs = build_contract_attrs
-    with_mocked_adapter([ attrs ]) do |ds, _|
-      PublicContracts::ImportService.new(ds).call
-      contract = Contract.find_by(external_id: attrs["external_id"])
-      assert_equal ds.id, contract.data_source_id
-    end
-  end
-
-  test "call sets country_code from attrs" do
-    attrs = build_contract_attrs("country_code" => "PT")
-    with_mocked_adapter([ attrs ]) do |ds, _|
-      PublicContracts::ImportService.new(ds).call
-      contract = Contract.find_by(external_id: attrs["external_id"])
-      assert_equal "PT", contract.country_code
-    end
-  end
-
-  test "call falls back to data_source country_code when attrs has none" do
-    attrs = build_contract_attrs.tap { |a| a.delete("country_code") }
-    with_mocked_adapter([ attrs ]) do |ds, _|
-      PublicContracts::ImportService.new(ds).call
-      contract = Contract.find_by(external_id: attrs["external_id"])
-      assert_equal ds.country_code, contract.country_code
-    end
-  end
-
-  test "call sets status to active and updates last_synced_at" do
-    with_mocked_adapter([]) do |ds, _|
-      PublicContracts::ImportService.new(ds).call
-      ds.reload
-      assert ds.active?
-      assert_not_nil ds.last_synced_at
-    end
-  end
-
-  test "call updates record_count" do
-    attrs1 = build_contract_attrs
-    attrs2 = build_contract_attrs
-    with_mocked_adapter([ attrs1, attrs2 ]) do |ds, _|
-      PublicContracts::ImportService.new(ds).call
-      assert_equal 2, ds.reload.record_count
-    end
-  end
-
-  test "call is idempotent for same external_id" do
-    attrs = build_contract_attrs
-    with_mocked_adapter([ attrs ]) do |ds, _|
-      PublicContracts::ImportService.new(ds).call
-    end
-    adapter2 = Minitest::Mock.new
-    adapter2.expect(:fetch_contracts, [ attrs ])
+  test "falls back to data source country when payload country missing" do
+    attrs = build_contract_attrs.tap { |contract| contract.delete("country_code") }
     ds = data_sources(:portal_base)
-    ds.stub(:adapter, adapter2) do
-      assert_no_difference "Contract.count" do
-        PublicContracts::ImportService.new(ds).call
-      end
+
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ attrs ] })) do
+      PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
     end
-    adapter2.verify
+
+    contract = Contract.find_by!(external_id: attrs["external_id"])
+    assert_equal "PT", contract.country_code
   end
 
-  test "call skips contract when contracting_entity has blank tax_id" do
-    attrs = build_contract_attrs(
-      "contracting_entity" => { "tax_identifier" => "", "name" => "X" }
-    )
-    with_mocked_adapter([ attrs ]) do |ds, _|
-      assert_no_difference "Contract.count" do
-        PublicContracts::ImportService.new(ds).call
-      end
-    end
-  end
+  test "skips invalid contracting entity rows" do
+    attrs = build_contract_attrs("contracting_entity" => { "tax_identifier" => "", "name" => "" })
+    ds = data_sources(:portal_base)
 
-  test "call skips contract when contracting_entity has blank name" do
-    attrs = build_contract_attrs(
-      "contracting_entity" => { "tax_identifier" => "123456789", "name" => "" }
-    )
-    with_mocked_adapter([ attrs ]) do |ds, _|
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ attrs ] })) do
       assert_no_difference "Contract.count" do
-        PublicContracts::ImportService.new(ds).call
+        result = PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
+        assert_equal 1, result[:failed]
       end
     end
   end
 
-  test "call skips winner with blank tax_id" do
-    attrs = build_contract_attrs(
-      "winners" => [ { "tax_identifier" => "", "name" => "X" } ]
-    )
-    with_mocked_adapter([ attrs ]) do |ds, _|
+  test "skips invalid winner rows" do
+    attrs = build_contract_attrs("winners" => [ { "tax_identifier" => "", "name" => "No ID" } ])
+    ds = data_sources(:portal_base)
+
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ attrs ] })) do
       assert_no_difference "ContractWinner.count" do
-        PublicContracts::ImportService.new(ds).call
+        PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
       end
     end
   end
 
-  # ── error handling ─────────────────────────────────────────────────────────
+  test "counts failed contracts and continues page import" do
+    valid = build_contract_attrs("external_id" => "ok-1")
+    invalid = build_contract_attrs("external_id" => "bad-1", "contracting_entity" => { "tax_identifier" => "", "name" => "" })
+    ds = data_sources(:portal_base)
 
-  test "call sets status to error when adapter raises" do
-    adapter = Minitest::Mock.new
-    adapter.expect(:fetch_contracts, nil) { raise RuntimeError, "API down" }
+    ds.stub(:adapter, FakeAdapter.new({ 1 => [ valid, invalid ] })) do
+      result = PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
+      assert_equal 2, result[:fetched]
+      assert_equal 1, result[:inserted]
+      assert_equal 1, result[:failed]
+    end
+  end
+
+  test "sets status to error when adapter raises" do
+    adapter = Object.new
+    def adapter.fetch_contracts(page:, limit:)
+      _ = page
+      _ = limit
+      raise RuntimeError, "API down"
+    end
+
     ds = data_sources(:portal_base)
     ds.stub(:adapter, adapter) do
       assert_raises(RuntimeError) do
-        PublicContracts::ImportService.new(ds).call
+        PublicContracts::ImportService.new(ds).call(page: 1, page_size: 50)
       end
     end
+
     assert ds.reload.error?
   end
 end
