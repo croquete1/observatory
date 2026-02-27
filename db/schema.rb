@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.0].define(version: 2026_02_27_090000) do
+ActiveRecord::Schema[8.0].define(version: 2026_02_27_103000) do
   create_table "contract_winners", force: :cascade do |t|
     t.integer "contract_id", null: false
     t.integer "entity_id", null: false
@@ -73,8 +73,26 @@ ActiveRecord::Schema[8.0].define(version: 2026_02_27_090000) do
     t.index ["tax_identifier", "country_code"], name: "index_entities_on_tax_identifier_and_country_code", unique: true
   end
 
+  create_table "flags", force: :cascade do |t|
+    t.integer "contract_id", null: false
+    t.string "country_code", null: false
+    t.string "flag_key", null: false
+    t.string "severity", null: false
+    t.decimal "confidence", precision: 4, scale: 3, default: "0.8", null: false
+    t.decimal "data_completeness", precision: 4, scale: 3, default: "1.0", null: false
+    t.json "evidence", default: {}, null: false
+    t.string "fingerprint", null: false
+    t.datetime "detected_at", null: false
+    t.datetime "created_at", null: false
+    t.datetime "updated_at", null: false
+    t.index ["contract_id", "flag_key"], name: "index_flags_on_contract_id_and_flag_key", unique: true
+    t.index ["contract_id"], name: "index_flags_on_contract_id"
+    t.index ["country_code", "flag_key"], name: "index_flags_on_country_code_and_flag_key"
+  end
+
   add_foreign_key "contract_winners", "contracts"
   add_foreign_key "contract_winners", "entities"
   add_foreign_key "contracts", "data_sources"
   add_foreign_key "contracts", "entities", column: "contracting_entity_id"
+  add_foreign_key "flags", "contracts"
 end

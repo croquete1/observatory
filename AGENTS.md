@@ -287,3 +287,45 @@ transparencia/                     Legacy Python scripts for data extraction
 - Entity resolution is mandatory: supplier names vary; always match on NIF where available, then fuzzy name + CPV.
 - Some OECD indicators could not be developed due to data availability — document which flags are constrained.
 - Beneficial ownership linkage is constrained by RCBE access rules and the CJEU ruling — do not assume it can be automated.
+
+## Flag foundation layer
+
+### Flag model (`flags`)
+
+- `Flag` stores deterministic and statistical signal outputs linked to `Contract`.
+- Required fields: `contract_id`, `country_code`, `flag_key`, `severity`, `fingerprint`, `detected_at`.
+- Audit fields:
+  - `evidence` (JSON): structured trigger evidence used by journalists/auditors.
+  - `confidence` (`0.0..1.0`) and `data_completeness` (`0.0..1.0`).
+- Idempotency is enforced at DB level with unique index on `[contract_id, flag_key]`.
+
+### Base service (`Flags::BaseService`)
+
+Use `app/services/flags/base_service.rb` as the common execution contract.
+
+Concrete flag services must implement:
+- `flag_key`
+- `description`
+- `severity`
+- `matches?(contract)`
+- `evidence(contract)`
+
+Optional overrides:
+- `candidates_scope` (default: `Contract.all`)
+- `confidence_for(contract)`
+- `data_completeness_for(contract)`
+- `fingerprint(contract, evidence)`
+
+Execution:
+- `call(country_code: nil, dry_run: false)`
+- Applies optional country scope.
+- Upserts flags idempotently (create on first run, update on re-run).
+- Emits structured completion log with evaluated/flagged/created/updated and duration.
+
+### Testing pattern for new flags
+
+- Add a dedicated service test under `test/services/flags/`.
+- Assert idempotency by running the service twice and checking no duplicate rows.
+- Assert metadata/evidence updates when source contract fields change.
+- Assert `country_code` filtering and `dry_run` behavior.
+- Keep tests deterministic and fully local (no HTTP calls).

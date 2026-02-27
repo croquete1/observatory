@@ -38,3 +38,11 @@ portal_base_inactive:
   adapter_class: PublicContracts::PT::PortalBaseClient
   status: inactive
   record_count: 0
+
+portal_es:
+  country_code: ES
+  name: Portal Contratación ES
+  source_type: api
+  adapter_class: PublicContracts::EU::TedClient
+  status: inactive
+  record_count: 0
