@@ -59,6 +59,12 @@ class PublicContracts::PT::PortalBaseClientTest < ActiveSupport::TestCase
     end
   end
 
+  test "get returns nil on invalid JSON payload" do
+    Net::HTTP.stub(:get_response, fake_success("not-json")) do
+      assert_equal [], @client.fetch_contracts
+    end
+  end
+
   test "accepts base_url from config" do
     client = PublicContracts::PT::PortalBaseClient.new("base_url" => "https://custom.example.com")
     assert_instance_of PublicContracts::PT::PortalBaseClient, client

@@ -195,10 +195,21 @@ bin/rails portal_base:ingest:full PORTAL_BASE_PAGE_SIZE=100
 
 Parâmetros operacionais:
 - `PORTAL_BASE_PAGE_SIZE` (default `100`)
-- `PORTAL_BASE_QUEUE_THREADS` (default `1`)
-- `PORTAL_BASE_QUEUE_PROCESSES` (default `1`)
+- `PORTAL_BASE_QUEUE_THREADS` (default `1`, limitado a `2`)
+- `PORTAL_BASE_QUEUE_PROCESSES` (default `1`, limitado a `2`)
 - `PORTAL_BASE_MAX_RETRIES` (default `5`)
 - `PORTAL_BASE_PAGE_SLEEP_SECONDS` (default `0.1`)
+- `PORTAL_BASE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default `3` falhas consecutivas por DataSource)
+
+Semântica de snapshot:
+- A ingestão completa é sempre um snapshot novo (`page=1`).
+- `last_success_page` é **apenas para recovery** e só é reutilizado quando o `run_id` ativo coincide.
+- Cada execução full enfileirada gera um `run_id` novo por DataSource em `data_sources.config["portal_base_ingestion"]`.
+
+Semântica do circuit breaker:
+- O breaker é por DataSource e abre após N falhas transitórias consecutivas.
+- O estado aberto tem TTL de 15 minutos.
+- A primeira página importada com sucesso limpa automaticamente o estado do breaker.
 
 Progresso e verificação:
 

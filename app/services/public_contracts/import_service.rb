@@ -1,17 +1,37 @@
 # :nocov:
 # frozen_string_literal: true
 
+require "set"
+
 module PublicContracts
   class ImportService
     DEFAULT_PAGE_SIZE = 50
+    IMPORTABLE_CONTRACT_COLUMNS = %w[
+      external_id
+      country_code
+      object
+      contract_type
+      procedure_type
+      publication_date
+      celebration_date
+      base_price
+      total_effective_price
+      cpv_code
+      location
+      contracting_entity_id
+      data_source_id
+      created_at
+      updated_at
+    ].freeze
+    UPSERT_UPDATE_COLUMNS = (IMPORTABLE_CONTRACT_COLUMNS - %w[external_id country_code created_at]).freeze
 
     def initialize(data_source_record, logger: Rails.logger)
       @ds = data_source_record
       @logger = logger
     end
 
-    def call(page: 1, page_size: DEFAULT_PAGE_SIZE, full: false, start_page: nil)
-      return import_full(page_size: page_size, start_page: start_page || page) if full
+    def call(page: 1, page_size: DEFAULT_PAGE_SIZE, full: false)
+      return import_full(page_size: page_size) if full
 
       import_page(page: page, page_size: page_size)
     rescue StandardError
@@ -21,8 +41,8 @@ module PublicContracts
 
     private
 
-    def import_full(page_size:, start_page: 1)
-      current_page = [ start_page.to_i, 1 ].max
+    def import_full(page_size:)
+      current_page = 1
       totals = empty_result.merge(start_page: current_page)
 
       loop do
@@ -38,17 +58,12 @@ module PublicContracts
 
     def import_page(page:, page_size:)
       started_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-      contracts = Array(@ds.adapter.fetch_contracts(page: page, limit: page_size))
-      result = empty_result.merge(page: page, page_size: page_size, fetched: contracts.size)
+      payload = Array(@ds.adapter.fetch_contracts(page: page, limit: page_size))
+      result = empty_result.merge(page: page, page_size: page_size, fetched: payload.size)
 
-      contracts.each do |attrs|
-        contract_result = import_contract(attrs)
-        result[:inserted] += 1 if contract_result == :inserted
-        result[:updated] += 1 if contract_result == :updated
-      rescue StandardError => e
-        result[:failed] += 1
-        structured_log(event: "portal_base.contract_failed", page: page, external_id: attrs["external_id"], error: e.message)
-      end
+      normalized_contracts = build_contract_rows(payload, result)
+      upsert_contract_rows(normalized_contracts, result)
+      sync_winners(normalized_contracts, payload)
 
       @ds.update!(
         status: :active,
@@ -72,57 +87,106 @@ module PublicContracts
       result
     end
 
-    def import_contract(attrs)
+    def build_contract_rows(payload, result)
+      now = Time.current
+
+      payload.filter_map do |attrs|
+        row = build_contract_row(attrs, now: now)
+        if row.nil?
+          result[:failed] += 1
+          structured_log(event: "portal_base.contract_failed", external_id: attrs["external_id"], error: "invalid payload")
+        end
+        row
+      rescue StandardError => e
+        result[:failed] += 1
+        structured_log(event: "portal_base.contract_failed", external_id: attrs["external_id"], error: e.message)
+        nil
+      end
+    end
+
+    def build_contract_row(attrs, now:)
       country_code = attrs["country_code"].presence || @ds.country_code
-      return :skipped if attrs["external_id"].blank? || country_code.blank?
+      external_id = attrs["external_id"].presence
+      return nil if external_id.blank? || country_code.blank?
 
       contracting = find_or_create_entity(
         attrs.dig("contracting_entity", "tax_identifier"),
         attrs.dig("contracting_entity", "name"),
         is_public_body: attrs.dig("contracting_entity", "is_public_body") || false
       )
-      return :skipped unless contracting
+      return nil unless contracting
 
-      contract = Contract.find_or_initialize_by(
-        external_id: attrs["external_id"],
-        country_code: country_code
-      )
-
-      is_new = contract.new_record?
-      contract.assign_attributes(
-        object: attrs["object"],
-        contract_type: attrs["contract_type"],
-        procedure_type: attrs["procedure_type"],
-        publication_date: attrs["publication_date"],
-        celebration_date: attrs["celebration_date"],
-        base_price: attrs["base_price"],
-        total_effective_price: attrs["total_effective_price"],
-        cpv_code: attrs["cpv_code"],
-        location: attrs["location"],
-        contracting_entity: contracting,
-        data_source: @ds
-      )
-
-      contract.save!
-      upsert_winners(contract, attrs)
-
-      is_new ? :inserted : :updated
-    rescue ActiveRecord::RecordNotUnique
-      retry
+      {
+        "external_id" => external_id,
+        "country_code" => country_code,
+        "object" => attrs["object"],
+        "contract_type" => attrs["contract_type"],
+        "procedure_type" => attrs["procedure_type"],
+        "publication_date" => attrs["publication_date"],
+        "celebration_date" => attrs["celebration_date"],
+        "base_price" => attrs["base_price"],
+        "total_effective_price" => attrs["total_effective_price"],
+        "cpv_code" => attrs["cpv_code"],
+        "location" => attrs["location"],
+        "contracting_entity_id" => contracting.id,
+        "data_source_id" => @ds.id,
+        "created_at" => now,
+        "updated_at" => now
+      }
     end
 
-    def upsert_winners(contract, attrs)
-      Array(attrs["winners"]).each do |winner_attrs|
-        winner = find_or_create_entity(
+    def upsert_contract_rows(rows, result)
+      return if rows.empty?
+
+      existing_keys = existing_contract_keys(rows)
+      rows.each do |row|
+        key = [ row["external_id"], row["country_code"] ]
+        existing_keys.include?(key) ? result[:updated] += 1 : result[:inserted] += 1
+      end
+
+      Contract.upsert_all(
+        rows,
+        unique_by: :index_contracts_on_external_id_and_country_code,
+        update_only: UPSERT_UPDATE_COLUMNS
+      )
+    end
+
+    def existing_contract_keys(rows)
+      external_ids = rows.map { |row| row["external_id"] }.uniq
+      country_codes = rows.map { |row| row["country_code"] }.uniq
+
+      Contract.where(external_id: external_ids, country_code: country_codes)
+              .pluck(:external_id, :country_code)
+              .to_set
+    end
+
+    def sync_winners(rows, payload)
+      return if rows.empty?
+
+      payload_by_key = payload.index_by { |attrs| [ attrs["external_id"], attrs["country_code"].presence || @ds.country_code ] }
+      contract_by_key = Contract.where(external_id: rows.map { |row| row["external_id"] },
+                                       country_code: rows.map { |row| row["country_code"] })
+                                .index_by { |contract| [ contract.external_id, contract.country_code ] }
+
+      contract_by_key.each do |key, contract|
+        winner_rows(payload_by_key[key]).each do |winner|
+          ContractWinner.find_or_create_by!(contract_id: contract.id, entity_id: winner.id)
+        end
+      end
+    end
+
+    def winner_rows(attrs)
+      return [] if attrs.nil?
+
+      Array(attrs["winners"]).filter_map do |winner_attrs|
+        find_or_create_entity(
           winner_attrs["tax_identifier"],
           winner_attrs["name"],
           is_company: winner_attrs["is_company"] || false
         )
-        next unless winner
-
-        ContractWinner.find_or_create_by!(contract: contract, entity: winner)
-      rescue ActiveRecord::RecordNotUnique
-        retry
+      rescue StandardError => e
+        structured_log(event: "portal_base.winner_failed", external_id: attrs["external_id"], error: e.message)
+        nil
       end
     end
 

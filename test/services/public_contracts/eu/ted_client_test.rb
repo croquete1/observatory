@@ -299,6 +299,10 @@ class PublicContracts::EU::TedClientTest < ActiveSupport::TestCase
     assert_equal "Unknown", @client.send(:extract_buyer_name, nil)
   end
 
+  test "extract_buyer_name returns Unknown for empty hash" do
+    assert_equal "Unknown", @client.send(:extract_buyer_name, {})
+  end
+
   test "rails_log falls back to warn when Rails logger is nil" do
     original_logger = Rails.logger
     Rails.logger = nil

@@ -203,10 +203,21 @@ bin/rails portal_base:ingest:full PORTAL_BASE_PAGE_SIZE=100
 
 Operational parameters:
 - `PORTAL_BASE_PAGE_SIZE` (default `100`)
-- `PORTAL_BASE_QUEUE_THREADS` (default `1`)
-- `PORTAL_BASE_QUEUE_PROCESSES` (default `1`)
+- `PORTAL_BASE_QUEUE_THREADS` (default `1`, capped at `2`)
+- `PORTAL_BASE_QUEUE_PROCESSES` (default `1`, capped at `2`)
 - `PORTAL_BASE_MAX_RETRIES` (default `5`)
 - `PORTAL_BASE_PAGE_SLEEP_SECONDS` (default `0.1`)
+- `PORTAL_BASE_CIRCUIT_BREAKER_FAILURE_THRESHOLD` (default `3` consecutive failures per DataSource)
+
+Snapshot semantics:
+- Full ingestion is always a fresh snapshot (`page=1`).
+- `last_success_page` is **recovery-only** and only reused when the same `run_id` is active.
+- Every full enqueue assigns a new `run_id` per DataSource under `data_sources.config["portal_base_ingestion"]`.
+
+Circuit breaker semantics:
+- Breaker is scoped per DataSource and opens after N consecutive transient failures.
+- Open-state TTL is 15 minutes.
+- First successful page import clears breaker state automatically.
 
 Progress & verification:
 

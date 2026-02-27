@@ -3,5 +3,4 @@
 
 class ImportService < PublicContracts::ImportService
 end
-
 # :nocov:

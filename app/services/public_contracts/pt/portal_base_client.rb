@@ -1,4 +1,3 @@
-# :nocov:
 # frozen_string_literal: true
 
 module PublicContracts
@@ -58,4 +57,3 @@ module PublicContracts
   end
 end
 
-# :nocov:
